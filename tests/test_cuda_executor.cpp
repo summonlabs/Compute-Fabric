@@ -50,6 +50,45 @@ TEST(cuda_actual_kernel_execution_and_verification) {
   EXPECT_EQ(res.elements, 200000ull);
 }
 
+TEST(cuda_vector_transform_covers_every_requested_element) {
+  auto devs = enumerate_cuda_devices();
+  if (devs.empty()) return;
+  // Above 4096 blocks of 256 threads. Every element still has to be
+  // transformed, so the digest matches the CPU kernel for the same task.
+  auto task = vt_task(2000000);
+  auto res = cuda_run_vector_transform(devs[0].device_ids[0], task, nullptr);
+  EXPECT_TRUE(res.success);
+  EXPECT_EQ(res.elements, 2000000ull);
+  std::string device;
+  WorkloadResult wr = run_cpu_kernel(task, nullptr, device);
+  EXPECT_TRUE(wr.success);
+  EXPECT_EQ(res.integrity_hex, wr.checksum_hex);
+}
+
+TEST(cuda_vector_transform_refuses_a_size_it_cannot_cover) {
+  auto devs = enumerate_cuda_devices();
+  if (devs.empty()) return;
+  // Over the device allocation bound: the task is refused, not answered with
+  // the transform of a shorter vector.
+  auto task = vt_task(4000001);
+  auto res = cuda_run_vector_transform(devs[0].device_ids[0], task, nullptr);
+  EXPECT_FALSE(res.success);
+  EXPECT_STR_CONTAINS(res.error_message, "exceeds bound");
+}
+
+TEST(cuda_vector_transform_matches_cpu_for_a_large_offset) {
+  auto devs = enumerate_cuda_devices();
+  if (devs.empty()) return;
+  auto task = vt_task(200000);
+  task.kernel_param_b = 0xFFFFFFF0ull;
+  auto res = cuda_run_vector_transform(devs[0].device_ids[0], task, nullptr);
+  EXPECT_TRUE(res.success);
+  std::string device;
+  WorkloadResult wr = run_cpu_kernel(task, nullptr, device);
+  EXPECT_TRUE(wr.success);
+  EXPECT_EQ(res.integrity_hex, wr.checksum_hex);
+}
+
 TEST(cuda_deterministic_output) {
   auto devs = enumerate_cuda_devices();
   if (devs.empty()) return;

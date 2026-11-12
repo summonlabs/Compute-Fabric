@@ -99,7 +99,10 @@ WorkloadResult run_cpu_kernel(const ComputeTask& task,
           return r;
         }
         uint32_t x = wmix(static_cast<uint32_t>(i) + seed);
-        uint32_t y = (mul_mod(x, a, m) + b) % m;
+        // Add in 64 bits: a 32-bit sum wraps for large b and is then no longer
+        // (a*x + b) mod m, which is what the CUDA kernel computes.
+        uint32_t y = static_cast<uint32_t>(
+            (static_cast<uint64_t>(mul_mod(x, a, m)) + b) % m);
         acc_lo += y;
         acc_hi ^= static_cast<uint64_t>(y) << 1;
         processed += 1;

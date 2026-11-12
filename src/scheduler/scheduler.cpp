@@ -63,10 +63,12 @@ std::vector<std::string> SchedulerPolicyEngine::exclusion_reasons(
   }
   const auto* cap = find_executor_cap(node, task.required_executor);
   if (cap != nullptr) {
-    if (cap->slots < static_cast<int32_t>(
-                         task.required_executor == ExecutorType::Cuda
-                             ? task.required_gpu_slots
-                             : task.required_cpu_slots)) {
+    // Compare in 64 bits: narrowing a request above INT32_MAX to int32_t makes
+    // it negative and the node would look eligible.
+    if (static_cast<int64_t>(cap->slots) <
+        static_cast<int64_t>(task.required_executor == ExecutorType::Cuda
+                                 ? task.required_gpu_slots
+                                 : task.required_cpu_slots)) {
       reasons.push_back("insufficient executor slots");
     }
   }

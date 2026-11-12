@@ -215,6 +215,8 @@ class Coordinator {
   void handle_coordinator_shutdown(const CoreCommand& cmd);
 
   ExecutionAttempt* find_active_attempt(const ExecutionAttemptId& id);
+  // Attempts made for a task across coordinator restarts, however they ended.
+  uint32_t attempts_used(const ComputeTaskId& task_id) const;
   void release_task_reservation(const ComputeTaskId& task_id);
   void on_task_succeeded_recursive(const ComputeTaskId& id);
   std::map<ComputeTaskId, ComputeTask> graph_to_tasks() const;
@@ -244,6 +246,9 @@ class Coordinator {
   SchedulerPolicyEngine scheduler_;
   std::map<NodeId, NodeRecord> nodes_;
   std::map<ComputeTaskId, std::vector<ExecutionAttempt>> attempts_;  // all
+  // Attempts counted by the durable retry count before the last restart that
+  // are not present in attempts_ (only committed attempts are reloaded).
+  std::map<ComputeTaskId, uint32_t> prior_attempts_;
   std::map<ComputeTaskId, int64_t> retry_ready_at_ms_;
   std::map<ComputeTaskId, int64_t> ready_at_ms_;
   std::map<ComputeTaskId, int64_t> dispatch_at_ms_;

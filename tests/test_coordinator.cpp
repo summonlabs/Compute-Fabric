@@ -166,6 +166,10 @@ TEST(coordinator_dag_execution_order) {
 
   auto st_b = wait_state(*c, b.id, {TaskState::Succeeded, TaskState::Failed}, 15000);
   EXPECT_EQ(st_b, TaskState::Succeeded);
+  // d only becomes runnable once b has succeeded, so it finishes after b is
+  // first observed as Succeeded: wait for it before checking its state.
+  auto st_d = wait_state(*c, d.id, {TaskState::Succeeded, TaskState::Failed}, 15000);
+  EXPECT_EQ(st_d, TaskState::Succeeded);
   // d must not have succeeded before b.
   auto insp_b = c->inspect(b.id);
   EXPECT_EQ(c->inspect(d.id).value().state, TaskState::Succeeded);
@@ -368,7 +372,15 @@ TEST(coordinator_idempotent_duplicate_cancel) {
   EXPECT_TRUE(r1.ok() && r2.ok());
   (void)r1;
   (void)r2;
+  // A task that was already running is cancelled cooperatively: it turns
+  // terminal when its node reports back, not when the cancel request returns.
+  auto deadline = now_millis() + 10000;
   auto insp = c->inspect(task.id);
+  while (now_millis() < deadline &&
+         !(insp.ok() && is_terminal(insp.value().state))) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    insp = c->inspect(task.id);
+  }
   EXPECT_TRUE(insp.ok());
   EXPECT_TRUE(is_terminal(insp.value().state));
 }
@@ -625,4 +637,468 @@ TEST(coordinator_cuda_placement_via_fabric) {
   if (!insp.value().attempts.empty()) {
     EXPECT_STR_CONTAINS(insp.value().attempts[0].device, "cuda");
   }
+}
+
+// ---------------------------------------------------------------------------
+// Authority fencing and retry accounting. These tests drive the coordinator
+// with scripted node connections so every interleaving is deterministic.
+// ---------------------------------------------------------------------------
+namespace {
+
+// A node connection scripted by the test: it registers, receives dispatches,
+// and reports whatever the test tells it to. It never heartbeats.
+struct ScriptedNode {
+  std::unique_ptr<net::Channel> ch;
+  NodeId id = Id128::random();
+  uint64_t request = 10;
+
+  bool join(uint16_t node_port) {
+    auto sock = net::TcpSocket::connect("127.0.0.1", node_port, 5000);
+    if (sock.failed()) return false;
+    ch = std::make_unique<net::Channel>(sock.take());
+    proto::Hello hello;
+    hello.role = "node";
+    proto::BinaryWriter hw;
+    proto::serialize(hw, hello);
+    if (ch->send_message(proto::kHello, proto::SenderKind::Node, id, 1,
+                         hw.bytes(), 5000).failed()) {
+      return false;
+    }
+    proto::NodeRegister reg;
+    reg.node_id = id;
+    reg.label = "scripted";
+    NodeCapacity cap;
+    cap.cpu_worker_slots = 1;
+    ExecutorCapability cpu;
+    cpu.type = ExecutorType::Cpu;
+    cpu.name = "cpu";
+    cpu.slots = 1;
+    cpu.healthy = true;
+    cap.executors.push_back(cpu);
+    reg.capacity = cap;
+    proto::BinaryWriter rw;
+    proto::serialize(rw, reg);
+    if (ch->send_message(proto::kNodeRegister, proto::SenderKind::Node, id, 2,
+                         rw.bytes(), 5000).failed()) {
+      return false;
+    }
+    return wait_for(proto::kNodeRegisterAck, nullptr, 10000);
+  }
+
+  bool wait_for(uint16_t type, std::vector<uint8_t>* payload,
+                int64_t timeout_ms) {
+    const int64_t deadline = now_millis() + timeout_ms;
+    while (now_millis() < deadline) {
+      auto frame = ch->recv_frame(250, proto::kMaxFramePayload);
+      if (frame.ok() && frame.value().header.message_type == type) {
+        if (payload) *payload = frame.value().payload;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool next_dispatch(proto::DispatchAttempt& out, int64_t timeout_ms = 10000) {
+    std::vector<uint8_t> payload;
+    if (!wait_for(proto::kDispatchAttempt, &payload, timeout_ms)) return false;
+    proto::BinaryReader r(payload);
+    auto m = proto::deserialize_dispatch_attempt(r);
+    if (m.failed()) return false;
+    out = m.value();
+    return true;
+  }
+
+  void started(const proto::DispatchAttempt& d) {
+    proto::AttemptStarted st;
+    st.attempt_id = d.attempt_id;
+    st.started_at_ms = now_millis();
+    st.device = "cpu";
+    proto::BinaryWriter w;
+    proto::serialize(w, st);
+    (void)ch->send_message(proto::kAttemptStarted, proto::SenderKind::Node, id,
+                           ++request, w.bytes(), 5000);
+  }
+
+  // Each report returns whether the coordinator accepted it.
+  bool complete(const proto::DispatchAttempt& d, const std::string& integrity) {
+    proto::AttemptComplete co;
+    co.attempt_id = d.attempt_id;
+    co.task_id = d.task.id;
+    co.reservation_id = d.reservation_id;
+    co.coordinator_epoch = d.coordinator_epoch;
+    co.output_integrity = integrity;
+    proto::BinaryWriter w;
+    proto::serialize(w, co);
+    (void)ch->send_message(proto::kAttemptComplete, proto::SenderKind::Node, id,
+                           ++request, w.bytes(), 5000);
+    return accepted(proto::kAttemptCompleteAck);
+  }
+
+  bool failed(const proto::DispatchAttempt& d) {
+    proto::AttemptFailed fa;
+    fa.attempt_id = d.attempt_id;
+    fa.task_id = d.task.id;
+    fa.reservation_id = d.reservation_id;
+    fa.coordinator_epoch = d.coordinator_epoch;
+    fa.failure_kind = static_cast<uint8_t>(FailureKind::ExecutorFailed);
+    fa.failure_reason = "scripted failure";
+    proto::BinaryWriter w;
+    proto::serialize(w, fa);
+    (void)ch->send_message(proto::kAttemptFailed, proto::SenderKind::Node, id,
+                           ++request, w.bytes(), 5000);
+    return accepted(proto::kAttemptFailedAck);
+  }
+
+  bool accepted(uint16_t ack_type) {
+    std::vector<uint8_t> payload;
+    if (!wait_for(ack_type, &payload, 5000)) return false;
+    proto::BinaryReader r(payload);
+    auto ack = proto::deserialize_attempt_ack(r);
+    return ack.ok() && ack.value().accepted;
+  }
+
+  void leave() {
+    if (ch) ch->close();
+  }
+};
+
+// A coordinator whose nodes are only ever lost by an explicit disconnect.
+struct ScriptedFabric {
+  std::string store_dir = unique_store_dir();
+  std::unique_ptr<Coordinator> coord;
+  uint16_t nport = 0;
+  uint16_t cport = 0;
+
+  void start() {
+    CoordinatorConfig cfg;
+    cfg.store_dir = store_dir;
+    cfg.node_port = 0;
+    cfg.client_port = 0;
+    cfg.heartbeat_timeout_ms = 60000;  // scripted nodes never heartbeat
+    coord = std::make_unique<Coordinator>(cfg);
+    auto ports = coord->start();
+    EXPECT_TRUE(ports.ok());
+    nport = ports.value().first;
+    cport = ports.value().second;
+  }
+
+  std::unique_ptr<FabricClient> client() {
+    auto c = std::make_unique<FabricClient>("127.0.0.1", cport);
+    EXPECT_TRUE(c->connect().ok());
+    return c;
+  }
+
+  ~ScriptedFabric() {
+    if (coord) coord->stop();
+  }
+};
+
+ComputeTask retryable_task(const char* name, uint32_t max_attempts) {
+  auto task = mk_task(name);
+  task.retry.max_attempts = max_attempts;
+  task.retry.retry_on_node_loss = true;
+  task.retry.retry_on_executor_failure = true;
+  task.retry.retry_backoff_ms = 10;
+  return task;
+}
+
+}  // namespace
+
+TEST(coordinator_superseded_attempt_cannot_touch_task_owned_by_retry) {
+  ScriptedFabric f;
+  f.start();
+  auto c = f.client();
+  auto task = retryable_task("superseded", 3);
+
+  // Attempt 0 starts on the first node, which is then lost.
+  ScriptedNode first;
+  EXPECT_TRUE(first.join(f.nport));
+  EXPECT_TRUE(c->submit(task.workload, "w", task).value().accepted);
+  proto::DispatchAttempt old_attempt;
+  EXPECT_TRUE(first.next_dispatch(old_attempt));
+  first.started(old_attempt);
+  EXPECT_EQ(wait_state(*c, task.id, {TaskState::Running}, 5000), TaskState::Running);
+  first.leave();
+
+  // The retry (attempt 1) is now running on a second node.
+  ScriptedNode second;
+  EXPECT_TRUE(second.join(f.nport));
+  proto::DispatchAttempt retry;
+  EXPECT_TRUE(second.next_dispatch(retry));
+  EXPECT_NE(retry.attempt_id, old_attempt.attempt_id);
+  second.started(retry);
+  auto deadline = now_millis() + 5000;
+  bool retry_running = false;
+  while (now_millis() < deadline && !retry_running) {
+    auto insp = c->inspect(task.id);
+    retry_running = insp.ok() && insp.value().state == TaskState::Running &&
+                    insp.value().attempts.size() == 2 &&
+                    insp.value().attempts[1].state == AttemptState::Started;
+    if (!retry_running) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_TRUE(retry_running);
+
+  // The lost node wakes up and reports for the superseded attempt. Neither a
+  // failure nor a completion may be accepted, and neither may disturb the
+  // task that the retry now owns.
+  ScriptedNode waking;
+  EXPECT_TRUE(waking.join(f.nport));
+  EXPECT_FALSE(waking.failed(old_attempt));
+  EXPECT_EQ(c->inspect(task.id).value().state, TaskState::Running);
+  EXPECT_FALSE(waking.complete(old_attempt, "superseded"));
+  EXPECT_EQ(c->inspect(task.id).value().state, TaskState::Running);
+
+  // The retry still commits, and it is the retry's result that is recorded.
+  EXPECT_TRUE(second.complete(retry, "current"));
+  EXPECT_EQ(wait_state(*c, task.id, {TaskState::Succeeded, TaskState::Failed}, 5000),
+            TaskState::Succeeded);
+  auto final_insp = c->inspect(task.id);
+  EXPECT_TRUE(final_insp.ok());
+  int committed = 0;
+  for (const auto& a : final_insp.value().attempts) {
+    if (!a.committed) continue;
+    ++committed;
+    EXPECT_EQ(a.id, retry.attempt_id);
+    EXPECT_EQ(a.output_integrity, std::string("current"));
+  }
+  EXPECT_EQ(committed, 1);
+  waking.leave();
+  second.leave();
+}
+
+TEST(coordinator_node_loss_retry_respects_max_attempts) {
+  ScriptedFabric f;
+  f.start();
+  auto c = f.client();
+  auto task = retryable_task("bounded", 2);
+
+  ScriptedNode first;
+  EXPECT_TRUE(first.join(f.nport));
+  EXPECT_TRUE(c->submit(task.workload, "w", task).value().accepted);
+  proto::DispatchAttempt a0;
+  EXPECT_TRUE(first.next_dispatch(a0));
+  EXPECT_EQ(a0.attempt_number, 0u);
+  first.started(a0);
+  EXPECT_EQ(wait_state(*c, task.id, {TaskState::Running}, 5000), TaskState::Running);
+  first.leave();
+
+  ScriptedNode second;
+  EXPECT_TRUE(second.join(f.nport));
+  proto::DispatchAttempt a1;
+  EXPECT_TRUE(second.next_dispatch(a1));
+  EXPECT_EQ(a1.attempt_number, 1u);
+  second.started(a1);
+  second.leave();
+
+  // Both permitted attempts were lost: the task fails instead of being
+  // requeued for a third attempt.
+  EXPECT_EQ(wait_state(*c, task.id, {TaskState::Failed}, 5000), TaskState::Failed);
+  EXPECT_EQ(c->inspect(task.id).value().attempts.size(), 2ull);
+}
+
+TEST(coordinator_restart_keeps_the_retry_budget) {
+  ScriptedFabric f;
+  f.start();
+  auto task = retryable_task("durable-budget", 2);
+  {
+    auto c = f.client();
+    ScriptedNode first;
+    EXPECT_TRUE(first.join(f.nport));
+    EXPECT_TRUE(c->submit(task.workload, "w", task).value().accepted);
+    proto::DispatchAttempt a0;
+    EXPECT_TRUE(first.next_dispatch(a0));
+    first.started(a0);
+    EXPECT_EQ(wait_state(*c, task.id, {TaskState::Running}, 5000), TaskState::Running);
+    c->close();
+    f.coord->stop();
+    f.coord.reset();
+    first.leave();
+  }
+
+  // Restart on the same store. The interrupted attempt already used one of
+  // the two permitted attempts, so the next one is attempt 1 and is the last.
+  f.start();
+  auto c = f.client();
+  ScriptedNode second;
+  EXPECT_TRUE(second.join(f.nport));
+  proto::DispatchAttempt a1;
+  EXPECT_TRUE(second.next_dispatch(a1));
+  EXPECT_EQ(a1.attempt_number, 1u);
+  second.started(a1);
+  EXPECT_EQ(wait_state(*c, task.id, {TaskState::Running}, 5000), TaskState::Running);
+  second.leave();
+  EXPECT_EQ(wait_state(*c, task.id, {TaskState::Failed}, 5000), TaskState::Failed);
+}
+
+TEST(node_runtime_stop_wakes_every_run_that_is_entering_its_wait) {
+  // run() waits without a timeout for the stop flag. A stop request that
+  // notifies without passing through the wait's mutex is lost when it lands
+  // between a run() testing the flag and blocking, and that run() then never
+  // returns. Several threads enter run() back to back while stop() fires, so
+  // one of them is inside that window when the flag is set.
+  const unsigned cores = std::thread::hardware_concurrency();
+  const int runners = cores >= 8 ? 6 : 2;
+  constexpr int kCycles = 3000;
+
+  std::atomic<NodeRuntime*> target{nullptr};
+  std::atomic<int> round{0};
+  std::atomic<int> returned{0};
+  std::atomic<bool> quit{false};
+
+  std::vector<std::thread> pool;
+  for (int i = 0; i < runners; ++i) {
+    pool.emplace_back([&] {
+      int seen = 0;
+      for (;;) {
+        // Spin at the gate so every runner is released at the same instant.
+        unsigned spins = 0;
+        while (round.load(std::memory_order_acquire) == seen) {
+          if (quit.load(std::memory_order_acquire)) return;
+          if ((++spins & 0xFFFu) == 0) std::this_thread::yield();
+        }
+        ++seen;
+        target.load(std::memory_order_acquire)->run();
+        returned.fetch_add(1, std::memory_order_release);
+      }
+    });
+  }
+
+  int completed = 0;
+  for (int cycle = 0; cycle < kCycles; ++cycle) {
+    NodeConfig nc;
+    nc.cpu_slots = 1;
+    NodeRuntime node(nc);
+    target.store(&node, std::memory_order_release);
+    returned.store(0, std::memory_order_release);
+    round.fetch_add(1, std::memory_order_release);
+    const auto gap_end = std::chrono::steady_clock::now() +
+                         std::chrono::nanoseconds((cycle % 64) * 100);
+    while (std::chrono::steady_clock::now() < gap_end) {
+    }
+    node.stop();
+    // Every runner has to come back before the node can be destroyed.
+    while (returned.load(std::memory_order_acquire) < runners) {
+      std::this_thread::yield();
+    }
+    ++completed;
+  }
+  quit.store(true, std::memory_order_release);
+  for (auto& t : pool) t.join();
+  EXPECT_EQ(completed, kCycles);
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle: reports that arrive before a start, and blocked tasks.
+// ---------------------------------------------------------------------------
+TEST(coordinator_attempt_rejected_before_start_fails_the_task) {
+  Fixture f;
+  f.start();
+  f.add_node(2);
+  auto c = f.client();
+  EXPECT_TRUE(c->wait_for_nodes(1, 10000));
+
+  // No executor supports this kernel, so the node rejects the dispatch: it
+  // reports a failure without ever reporting a start, and the task is still
+  // Dispatching when that failure arrives.
+  auto task = mk_task("no-kernel");
+  task.kernel = KernelType::None;
+  EXPECT_TRUE(c->submit(task.workload, "w", task).value().accepted);
+
+  // One attempt is allowed. The task fails; it is not dispatched again.
+  EXPECT_EQ(wait_state(*c, task.id, {TaskState::Failed, TaskState::Succeeded}, 4000),
+            TaskState::Failed);
+  auto insp = c->inspect(task.id);
+  EXPECT_TRUE(insp.ok());
+  EXPECT_EQ(insp.value().attempts.size(), 1ull);
+}
+
+TEST(coordinator_completion_without_start_report_commits_the_task) {
+  ScriptedFabric f;
+  f.start();
+  auto c = f.client();
+  auto task = retryable_task("unstarted", 1);
+
+  ScriptedNode node;
+  EXPECT_TRUE(node.join(f.nport));
+  EXPECT_TRUE(c->submit(task.workload, "w", task).value().accepted);
+  proto::DispatchAttempt d;
+  EXPECT_TRUE(node.next_dispatch(d));
+
+  // The coordinator accepts a completion for an attempt that never reported a
+  // start. Having accepted it, the task must be Succeeded, not left
+  // Dispatching to be requeued and executed a second time.
+  EXPECT_TRUE(node.complete(d, "result"));
+  auto insp = c->inspect(task.id);
+  EXPECT_TRUE(insp.ok());
+  EXPECT_EQ(insp.value().state, TaskState::Succeeded);
+  EXPECT_EQ(insp.value().attempts.size(), 1ull);
+  node.leave();
+}
+
+TEST(coordinator_dependents_of_a_failed_task_fail) {
+  Fixture f;
+  f.start();
+  f.add_node(2);
+  auto c = f.client();
+  EXPECT_TRUE(c->wait_for_nodes(1, 10000));
+
+  // The upstream task fails while running: its size is over the kernel bound.
+  auto upstream = mk_task("upstream", 65u * 1000u * 1000u);
+  auto child = mk_task("child");
+  auto grandchild = mk_task("grandchild");
+  child.dependencies = {upstream.id};
+  grandchild.dependencies = {child.id};
+  EXPECT_TRUE(c->submit(upstream.workload, "w", upstream).value().accepted);
+  EXPECT_TRUE(c->submit(child.workload, "w", child).value().accepted);
+  EXPECT_TRUE(c->submit(grandchild.workload, "w", grandchild).value().accepted);
+  EXPECT_EQ(wait_state(*c, upstream.id, {TaskState::Failed, TaskState::Succeeded}, 10000),
+            TaskState::Failed);
+
+  // Neither dependent can ever run. Both end instead of staying Blocked, and
+  // neither is dispatched.
+  EXPECT_EQ(wait_state(*c, child.id, {TaskState::Failed, TaskState::Succeeded}, 3000),
+            TaskState::Failed);
+  EXPECT_EQ(wait_state(*c, grandchild.id, {TaskState::Failed, TaskState::Succeeded}, 3000),
+            TaskState::Failed);
+  EXPECT_TRUE(c->inspect(child.id).value().attempts.empty());
+  EXPECT_TRUE(c->inspect(grandchild.id).value().attempts.empty());
+}
+
+TEST(coordinator_dependents_of_a_cancelled_task_fail) {
+  ScriptedFabric f;  // no nodes: nothing is ever dispatched
+  f.start();
+  auto c = f.client();
+
+  auto upstream = mk_task("cancelled-upstream");
+  auto child = mk_task("child");
+  child.dependencies = {upstream.id};
+  EXPECT_TRUE(c->submit(upstream.workload, "w", upstream).value().accepted);
+  EXPECT_TRUE(c->submit(child.workload, "w", child).value().accepted);
+
+  auto rc = c->cancel(upstream.id);
+  EXPECT_TRUE(rc.ok());
+  EXPECT_TRUE(rc.value().cancelled);
+  EXPECT_EQ(wait_state(*c, child.id, {TaskState::Failed, TaskState::Succeeded}, 3000),
+            TaskState::Failed);
+}
+
+TEST(coordinator_task_submitted_after_its_dependency_succeeded_runs) {
+  Fixture f;
+  f.start();
+  f.add_node(2);
+  auto c = f.client();
+  EXPECT_TRUE(c->wait_for_nodes(1, 10000));
+
+  auto first = mk_task("first");
+  EXPECT_TRUE(c->submit(first.workload, "w", first).value().accepted);
+  EXPECT_EQ(wait_state(*c, first.id, {TaskState::Succeeded, TaskState::Failed}, 15000),
+            TaskState::Succeeded);
+
+  // The dependency finished before this task existed, so no later success
+  // report will ever release it.
+  auto second = mk_task("second");
+  second.dependencies = {first.id};
+  EXPECT_TRUE(c->submit(second.workload, "w", second).value().accepted);
+  EXPECT_EQ(wait_state(*c, second.id, {TaskState::Succeeded, TaskState::Failed}, 5000),
+            TaskState::Succeeded);
 }

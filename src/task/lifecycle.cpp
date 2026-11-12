@@ -39,8 +39,10 @@ bool TaskLifecycle::is_legal(TaskState from, TaskState to) {
       return to == TaskState::Blocked || to == TaskState::Ready ||
              to == TaskState::Cancelled || to == TaskState::Expired;
     case TaskState::Blocked:
+      // Failed: a dependency ended without succeeding, so the task can never
+      // become Ready.
       return to == TaskState::Ready || to == TaskState::Cancelled ||
-             to == TaskState::Expired;
+             to == TaskState::Expired || to == TaskState::Failed;
     case TaskState::Ready:
       return to == TaskState::Planning || to == TaskState::Cancelled ||
              to == TaskState::Expired;

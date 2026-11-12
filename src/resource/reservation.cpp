@@ -55,11 +55,17 @@ ReservationResult ReservationRegistry::try_reserve(
     out.reasons.push_back("zero slots requested");
     return out;
   }
+  // Capacity checks subtract instead of adding: `used + slots` wraps for a
+  // large request and would then pass, over-committing the node and corrupting
+  // every later usage sum.
+  const uint32_t cap_slots =
+      cap->slots > 0 ? static_cast<uint32_t>(cap->slots) : 0;
   uint32_t used = used_executor_slots_locked(node.id, executor);
-  if (used + slots > static_cast<uint32_t>(cap->slots)) {
+  if (slots > cap_slots || used > cap_slots - slots) {
+    const uint32_t free_slots = used < cap_slots ? cap_slots - used : 0;
     out.reasons.push_back("insufficient executor slots (" +
                           std::to_string(slots) + " needed, " +
-                          std::to_string(cap->slots - used) + " free)");
+                          std::to_string(free_slots) + " free)");
     return out;
   }
   if (executor == ExecutorType::Cpu) {
@@ -68,14 +74,18 @@ ReservationResult ReservationRegistry::try_reserve(
       (void)id;
       if (r.node_id == node.id && !r.released) used_cpu += r.slots;
     }
-    if (used_cpu + slots > static_cast<uint32_t>(node.capacity.cpu_worker_slots)) {
+    const uint32_t workers = node.capacity.cpu_worker_slots > 0
+                                 ? static_cast<uint32_t>(node.capacity.cpu_worker_slots)
+                                 : 0;
+    if (slots > workers || used_cpu > workers - slots) {
       out.reasons.push_back("insufficient CPU worker slots");
       return out;
     }
   }
   uint64_t used_scr = used_scratch(node.id);
-  if (used_scr + scratch_bytes > node.capacity.host_memory_scheduling_bytes &&
-      scratch_bytes > 0) {
+  const uint64_t scratch_budget = node.capacity.host_memory_scheduling_bytes;
+  if (scratch_bytes > 0 &&
+      (scratch_bytes > scratch_budget || used_scr > scratch_budget - scratch_bytes)) {
     out.reasons.push_back("scratch budget exceeded");
     return out;
   }

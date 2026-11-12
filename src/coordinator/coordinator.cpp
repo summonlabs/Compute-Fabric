@@ -82,6 +82,23 @@ bool wait_for_outbound_drain(const std::shared_ptr<Conn>& conn,
   return conn->outbound.empty() && !conn->writer_in_flight;
 }
 
+// An attempt holds execution authority for its task only while it is active
+// and its reservation is the one currently recorded for that task. Dispatch
+// timeout, node loss, failure and cancellation all drop that record, so a
+// superseded attempt can no longer start, fail, cancel, or commit a task that
+// a newer attempt now owns, nor release that newer attempt's reservation.
+bool attempt_holds_authority(
+    const std::map<ComputeTaskId, ReservationId>& live_reservations,
+    const ExecutionAttempt& attempt) {
+  if (attempt.state != AttemptState::Dispatched &&
+      attempt.state != AttemptState::Started) {
+    return false;
+  }
+  auto it = live_reservations.find(attempt.task_id);
+  return it != live_reservations.end() &&
+         it->second == attempt.reservation_id;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -158,6 +175,16 @@ Result<std::pair<uint16_t, uint16_t>> Coordinator::start() {
     (void)tid;
     attempts_[tid] = attempts;
   }
+  // Only committed attempts are stored individually; the durable retry count
+  // also covers the uncommitted ones. Carry that remainder forward so a
+  // restart does not hand every task a fresh retry budget.
+  for (const auto& [tid, count] : durable_.retry_counts) {
+    auto reloaded = attempts_.find(tid);
+    const size_t have = reloaded != attempts_.end() ? reloaded->second.size() : 0;
+    if (count > have) {
+      prior_attempts_[tid] = count - static_cast<uint32_t>(have);
+    }
+  }
   for (const auto& sp : durable_.placements) {
     last_placements_[sp.task_id] = sp.decision;
   }
@@ -170,7 +197,8 @@ Result<std::pair<uint16_t, uint16_t>> Coordinator::start() {
       if (r.ok()) {
         telemetry_task("recovery.task_requeued", id,
                        Json::make_object().set("prev_state", task_state_name(st)));
-        if (task.retry.retry_on_node_loss && task.retry.max_attempts > 1) {
+        if (task.retry.retry_on_node_loss && task.retry.max_attempts > 1 &&
+            attempts_used(id) < task.retry.max_attempts) {
           graph_.set_state(id, TaskState::RetryPending);
           retry_ready_at_ms_[id] =
               now_millis() + static_cast<int64_t>(task.retry.retry_backoff_ms);
@@ -235,7 +263,12 @@ void Coordinator::persist() {
   }
   durable_.retry_counts.clear();
   for (const auto& [tid, list] : attempts_) {
-    durable_.retry_counts[tid] = static_cast<uint32_t>(list.size());
+    (void)list;
+    durable_.retry_counts[tid] = attempts_used(tid);
+  }
+  for (const auto& [tid, prior] : prior_attempts_) {
+    (void)prior;
+    durable_.retry_counts[tid] = attempts_used(tid);
   }
   durable_.placements.clear();
   for (const auto& [tid, sp] : placement_records_) {
@@ -1129,7 +1162,7 @@ void Coordinator::schedule_ready_tasks() {
     a.coordinator_epoch = durable_.epoch;
     a.reservation_id = resv.id;
     a.executor = executor;
-    a.attempt_number = static_cast<uint32_t>(attempts_[task_id].size());
+    a.attempt_number = attempts_used(task_id);
     a.dispatched_at_ms = now_millis();
     a.state = AttemptState::Dispatched;
     a.device = decision.chosen_device;
@@ -1206,6 +1239,7 @@ void Coordinator::handle_attempt_started(const CoreCommand& cmd) {
   ExecutionAttempt* active = find_active_attempt(st.attempt_id);
   if (!active) return;
   if (active->coordinator_epoch != durable_.epoch) return;
+  if (!attempt_holds_authority(task_reservation_, *active)) return;
   active->state = AttemptState::Started;
   active->started_at_ms = st.started_at_ms;
   active->device = st.device;
@@ -1252,6 +1286,30 @@ void Coordinator::handle_attempt_complete(const CoreCommand& cmd) {
     }
     telemetry_.event("attempt.stale_rejected",
                      Json::make_object().set("attempt", co.attempt_id.to_hex()),
+                     durable_.epoch);
+    return;
+  }
+  if (!attempt_holds_authority(task_reservation_, *active)) {
+    // A known attempt that no longer owns its task: it was lost, timed out,
+    // failed or cancelled, and the task may already be running under a newer
+    // attempt. Its result must not commit the task, and it must not take the
+    // cancellation path below, which would release the newer reservation.
+    proto::AttemptAck ack;
+    ack.attempt_id = co.attempt_id;
+    ack.accepted = false;
+    ack.error = "stale_attempt";
+    proto::BinaryWriter w;
+    proto::serialize(w, ack);
+    if (cmd.node_conn) {
+      auto f = proto::make_frame(proto::kAttemptCompleteAck,
+                                 proto::SenderKind::Coordinator, Id128::zero(),
+                                 cmd.request_id, w.bytes());
+      queue_outbound(cmd.node_conn, std::move(f));
+    }
+    telemetry_.event("attempt.stale_rejected",
+                     Json::make_object()
+                         .set("attempt", co.attempt_id.to_hex())
+                         .set("reason", "attempt superseded"),
                      durable_.epoch);
     return;
   }
@@ -1322,6 +1380,12 @@ void Coordinator::handle_attempt_complete(const CoreCommand& cmd) {
   active->bytes_transferred = co.bytes_transferred;
   active->device = co.device;
 
+  // A completion is accepted for an attempt whose start was never reported,
+  // but Dispatching cannot move to Succeeded directly. Left in Dispatching,
+  // the committed task would be requeued by the dispatch timeout and run again.
+  if (graph_.state(active->task_id) == TaskState::Dispatching) {
+    graph_.set_state(active->task_id, TaskState::Running);
+  }
   graph_.set_state(active->task_id, TaskState::Succeeded);
   release_task_reservation(active->task_id);
   cancel_requested_.erase(active->task_id);
@@ -1377,6 +1441,23 @@ void Coordinator::handle_attempt_failed(const CoreCommand& cmd) {
   }
   if (active->coordinator_epoch != durable_.epoch) return;
   if (active->state == AttemptState::Succeeded || active->committed) return;
+  if (!attempt_holds_authority(task_reservation_, *active)) {
+    // A failure report from a superseded attempt (or a duplicate report) must
+    // not fail or requeue the task, or release a newer attempt's reservation.
+    proto::AttemptAck ack;
+    ack.attempt_id = fa.attempt_id;
+    ack.accepted = false;
+    ack.error = "stale_attempt";
+    proto::BinaryWriter w;
+    proto::serialize(w, ack);
+    if (cmd.node_conn) {
+      auto f = proto::make_frame(proto::kAttemptFailedAck,
+                                 proto::SenderKind::Coordinator, Id128::zero(),
+                                 cmd.request_id, w.bytes());
+      queue_outbound(cmd.node_conn, std::move(f));
+    }
+    return;
+  }
 
   active->state = AttemptState::Failed;
   active->failure_kind = static_cast<FailureKind>(fa.failure_kind);
@@ -1394,6 +1475,13 @@ void Coordinator::handle_attempt_failed(const CoreCommand& cmd) {
 
   release_task_reservation(active->task_id);
   if (current != TaskState::Succeeded) {
+    // A node that rejects a dispatch reports the failure without a start, so
+    // the task is still Dispatching, which cannot move to RetryPending or
+    // Failed directly. Left there, the dispatch timeout would requeue it
+    // forever, whatever the retry budget says.
+    if (current == TaskState::Dispatching) {
+      graph_.set_state(active->task_id, TaskState::Lost);
+    }
     if (can_retry) {
       graph_.set_state(active->task_id, TaskState::RetryPending);
       retry_ready_at_ms_[active->task_id] =
@@ -1437,6 +1525,7 @@ void Coordinator::handle_attempt_cancelled(const CoreCommand& cmd) {
   ExecutionAttempt* active = find_active_attempt(ca.attempt_id);
   if (!active) return;
   if (active->coordinator_epoch != durable_.epoch) return;
+  if (!attempt_holds_authority(task_reservation_, *active)) return;
   active->state = AttemptState::Cancelled;
   active->failure_kind = FailureKind::Cancelled;
   active->failure_reason = ca.reason;
@@ -1621,7 +1710,7 @@ void Coordinator::handle_task_cancel(const CoreCommand& cmd) {
       // Best-effort cancel to the node.
       ExecutionAttempt* active = nullptr;
       for (auto& a : attempts_[cancel.task_id]) {
-        if (a.state == AttemptState::Started || a.state == AttemptState::Dispatched) {
+        if (attempt_holds_authority(task_reservation_, a)) {
           active = &a;
           break;
         }
@@ -1884,6 +1973,27 @@ void Coordinator::sweep() {
     }
   }
 
+  // Blocked tasks. A dependency reporting success releases its dependents, but
+  // nothing else re-evaluates them: a task submitted after its dependencies
+  // already succeeded would wait forever, and so would every dependent of a
+  // task that ended without succeeding.
+  bool blocked_changed = false;
+  for (const auto& id : graph_.task_ids()) {
+    if (graph_.state(id) != TaskState::Blocked) continue;
+    if (graph_.dependencies_satisfied(id)) {
+      graph_.set_state(id, TaskState::Ready);
+      ready_at_ms_[id] = now;
+      telemetry_task("task.ready", id, Json::make_object());
+      blocked_changed = true;
+    } else if (graph_.dependency_poisoned(id)) {
+      graph_.set_state(id, TaskState::Failed);
+      telemetry_task("task.fail", id,
+                     Json::make_object().set("reason", "dependency failed"));
+      blocked_changed = true;
+    }
+  }
+  if (blocked_changed) persist();
+
   // Schedule ready tasks.
   schedule_ready_tasks();
 }
@@ -1903,21 +2013,30 @@ void Coordinator::handle_node_loss(const NodeId& node_id) {
   reservations_.release_all_for_node(node_id);
   telemetry_node("node.offline", node_id, Json::make_object());
 
-  // Mark running attempts Lost and requeue.
+  // Mark running attempts Lost and requeue. Only an attempt that still holds
+  // its task's authority requeues the task: an older attempt on this node
+  // that was already superseded must not pull the task (and its reservation)
+  // away from the attempt now running elsewhere.
   std::vector<ComputeTaskId> affected;
-  for (const auto& [tid, list] : attempts_) {
-    for (const auto& a : list) {
+  for (auto& [tid, list] : attempts_) {
+    for (auto& a : list) {
       if (a.node_id == node_id && !a.committed &&
           (a.state == AttemptState::Started || a.state == AttemptState::Dispatched)) {
-        affected.push_back(tid);
+        if (attempt_holds_authority(task_reservation_, a)) affected.push_back(tid);
+        a.state = AttemptState::Lost;
+        a.failure_kind = FailureKind::NodeLost;
+        a.failure_reason = "node lost";
+        a.completed_at_ms = now_millis();
       }
     }
   }
   for (const auto& tid : affected) {
     const ComputeTask* task = graph_.find(tid);
     if (!task) continue;
+    // The retry budget covers every attempt, however it ended.
     bool can_retry = task->retry.retry_on_node_loss &&
-                     task->retry.max_attempts > 1;
+                     task->retry.max_attempts > 1 &&
+                     attempts_used(tid) < task->retry.max_attempts;
     graph_.set_state(tid, TaskState::Lost);
     if (can_retry) {
       graph_.set_state(tid, TaskState::RetryPending);
@@ -1948,6 +2067,15 @@ ExecutionAttempt* Coordinator::find_active_attempt(const ExecutionAttemptId& id)
   return nullptr;
 }
 
+uint32_t Coordinator::attempts_used(const ComputeTaskId& task_id) const {
+  uint32_t used = 0;
+  auto prior = prior_attempts_.find(task_id);
+  if (prior != prior_attempts_.end()) used = prior->second;
+  auto list = attempts_.find(task_id);
+  if (list != attempts_.end()) used += static_cast<uint32_t>(list->second.size());
+  return used;
+}
+
 void Coordinator::release_task_reservation(const ComputeTaskId& task_id) {
   auto it = task_reservation_.find(task_id);
   if (it != task_reservation_.end()) {
@@ -1968,7 +2096,6 @@ void Coordinator::on_task_succeeded_recursive(const ComputeTaskId& id) {
     if (graph_.dependency_poisoned(dep) &&
         (graph_.state(dep) == TaskState::Blocked ||
          graph_.state(dep) == TaskState::Submitted)) {
-      graph_.set_state(dep, TaskState::Lost);
       graph_.set_state(dep, TaskState::Failed);
       telemetry_task("task.fail", dep,
                      Json::make_object().set("reason", "dependency failed"));

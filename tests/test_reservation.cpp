@@ -1,6 +1,8 @@
 #include "framework.h"
 
 #include "compute_fabric/resource/reservation.h"
+#include "compute_fabric/scheduler/scheduler.h"
+#include "compute_fabric/state/state_locality.h"
 
 using namespace cf;
 
@@ -131,4 +133,37 @@ TEST(reservation_release_all_for_node) {
   }
   reg.release_all_for_node(node.id);
   EXPECT_EQ(reg.active_count(), 0ull);
+}
+TEST(reservation_capacity_arithmetic_does_not_wrap) {
+  auto node = cpu_node(2);
+  ReservationRegistry reg;
+  EXPECT_TRUE(reg.try_reserve(node, 1, Id128::random(), ExecutorType::Cpu, 1, 16).reservation);
+
+  // 1 slot in use + 0xFFFFFFFF requested wraps to 0 in 32 bits and used to be
+  // granted, over-committing the node.
+  auto slots = reg.try_reserve(node, 1, Id128::random(), ExecutorType::Cpu, 0xFFFFFFFFu, 0);
+  EXPECT_FALSE(slots.reservation.has_value());
+  EXPECT_EQ(reg.used_slots(node.id, ExecutorType::Cpu), 1u);
+
+  // 16 scratch bytes in use + (2^64 - 16) requested wraps to 0 in 64 bits.
+  auto scratch = reg.try_reserve(node, 1, Id128::random(), ExecutorType::Cpu, 1,
+                                 ~uint64_t{0} - 15);
+  EXPECT_FALSE(scratch.reservation.has_value());
+  EXPECT_EQ(reg.used_scratch(node.id), 16ull);
+  EXPECT_EQ(reg.active_count(), 1ull);
+}
+
+TEST(scheduler_excludes_node_for_slot_request_above_int32) {
+  auto node = cpu_node(2);
+  std::map<NodeId, NodeRecord> nodes;
+  nodes[node.id] = node;
+  ComputeTask task;
+  task.id = Id128::random();
+  task.required_executor = ExecutorType::Cpu;
+  task.required_cpu_slots = 0x80000000u;  // negative once narrowed to int32_t
+  SchedulerPolicyEngine engine;
+  ReservationRegistry reg;
+  StateLocalityRegistry state;
+  auto decision = engine.place(task, nodes, reg, state);
+  EXPECT_FALSE(decision.feasible);
 }

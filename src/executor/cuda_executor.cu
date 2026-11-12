@@ -163,8 +163,14 @@ CudaRunResult cuda_run_vector_transform(
     return r;
   }
 
-  uint64_t n = task.kernel_param_n > 0 ? task.kernel_param_n : 1;
-  if (n > 4u * 1000u * 1000u) n = 4u * 1000u * 1000u;  // bounded allocations
+  const uint64_t n = task.kernel_param_n > 0 ? task.kernel_param_n : 1;
+  // Bounded allocations. A larger request is refused: transforming only a
+  // prefix would report success for a result the task did not ask for.
+  if (n > 4u * 1000u * 1000u) {
+    r.success = false;
+    r.error_message = "kernel size exceeds bound";
+    return r;
+  }
   const uint32_t a = static_cast<uint32_t>(task.kernel_param_a & 0xFFFFFFFFu);
   const uint32_t b = static_cast<uint32_t>(task.kernel_param_b & 0xFFFFFFFFu);
   const uint32_t seed = static_cast<uint32_t>(task.seed & 0xFFFFFFFFu);
@@ -188,10 +194,11 @@ CudaRunResult cuda_run_vector_transform(
   uint32_t* d_partial = nullptr;
   uint32_t blocks = 0;
   const uint32_t threads = 256;
+  // The grid has to cover every element. n is bounded above, so this is at
+  // most 15625 blocks; capping it lower leaves the tail of y uncomputed.
   if (n > 0) {
     blocks = static_cast<uint32_t>((n + threads - 1) / threads);
   }
-  if (blocks > 4096) blocks = 4096;
   size_t part_bytes = static_cast<size_t>(blocks) * sizeof(uint64_t);
   d_partial = static_cast<uint32_t*>(
       cuda_alloc_checked(part_bytes, "cudaMalloc partial", err));

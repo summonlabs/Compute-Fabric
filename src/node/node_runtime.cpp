@@ -47,7 +47,13 @@ Result<void> NodeRuntime::send_frame(const proto::Frame& frame,
 void NodeRuntime::request_runtime_stop() {
   connected_.store(false);
   stopping_.store(true);
+  // Waiters test stopping_ under these mutexes. Passing through each one after
+  // the store keeps the notification from being lost by a waiter that has
+  // evaluated its predicate but has not blocked yet; run() waits without a
+  // timeout and would otherwise never return.
+  { std::lock_guard<std::mutex> lk(lifecycle_mu_); }
   lifecycle_cv_.notify_all();
+  { std::lock_guard<std::mutex> lk(comp_mu_); }
   comp_cv_.notify_all();
 }
 

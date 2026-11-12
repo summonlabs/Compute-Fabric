@@ -96,6 +96,22 @@ TEST(cpu_executor_cpu_and_cuda_digest_match) {
   cpu.shutdown(false);
 }
 
+TEST(cpu_vector_transform_offset_does_not_wrap) {
+  // y = (a*x + b) mod m with m = 0xFFFFFFFB, so b = m is the same transform
+  // as b = 0. A 32-bit sum of the product and b wraps and breaks that.
+  CpuExecutorBackend cpu(2);
+  auto zero = kernel_task("vt", KernelType::VectorTransform, 1000);
+  zero.kernel_param_b = 0;
+  auto modulus = zero;
+  modulus.kernel_param_b = 0xFFFFFFFBull;
+  auto out_zero = run_sync(cpu, zero);
+  auto out_modulus = run_sync(cpu, modulus);
+  EXPECT_TRUE(out_zero.success);
+  EXPECT_TRUE(out_modulus.success);
+  EXPECT_EQ(out_zero.output_integrity, out_modulus.output_integrity);
+  cpu.shutdown(false);
+}
+
 TEST(cpu_executor_failure_reporting) {
   CpuExecutorBackend cpu(2);
   auto task = kernel_task("unsupported", KernelType::None, 100);
